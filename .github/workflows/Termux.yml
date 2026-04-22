@@ -1,96 +1,120 @@
-name: Build Box64 for Termux Only
+name: Build Box64 for Termux Native
 
 on:
-  workflow_dispatch:  # Jalankan manual
+  workflow_dispatch:  # Manual trigger
   push:
-    branches: [ main, master ]
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
-  build-termux:
+  build-box64-termux:
     runs-on: ubuntu-latest
-    
+    strategy:
+      matrix:
+        arch: [aarch64]  # Termux native hanya untuk ARM64
+
     steps:
-      - name: Checkout Box64 Repository
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        repository: ptitSeb/box64
+        fetch-depth: 1
 
-      - name: Environment Preparation for Termux
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install git cmake make python3 patchelf p7zip-full wget
-          
-          # Download Android NDK
-          wget -q https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
-          unzip -qq android-ndk-r26b-linux.zip
-          echo "BOX64_COMPILER=$PWD/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> $GITHUB_ENV
-          
-          # Setup Termux environment (tanpa termux-docker yang bermasalah)
-          mkdir -p /data/data/com.termux/files/usr/lib
-          
-          # Download libandroid-sysv-semaphore dengan URL yang benar
-          wget https://packages.termux.org/apt/termux-main/pool/main/liba/libandroid-sysv-semaphore/libandroid-sysv-semaphore_0.1_aarch64.deb || \
-          wget https://raw.githubusercontent.com/termux/termux-packages/master/root-packages/libandroid-sysv-semaphore/build.sh
-          
-          # Coba extract jika download berhasil
-          if [ -f libandroid-sysv-semaphore_0.1_aarch64.deb ]; then
-            7z x libandroid-sysv-semaphore_0.1_aarch64.deb || true
-            [ -f data.tar.xz ] && tar -xf data.tar.xz || true
-          fi
-          
-          # Buat library dummy jika tidak ada
-          if [ ! -f data/data/com.termux/files/usr/lib/libandroid-sysv-semaphore.so ]; then
-            echo "Creating dummy library..."
-            echo 'int sem_init() { return 0; }' > /tmp/dummy.c
-            gcc -shared -o /tmp/libandroid-sysv-semaphore.so /tmp/dummy.c
-            mkdir -p data/data/com.termux/files/usr/lib
-            cp /tmp/libandroid-sysv-semaphore.so data/data/com.termux/files/usr/lib/
-          fi
-          
-          # Copy library ke system
-          sudo cp -rf data/data/com.termux/files/usr/lib/* /usr/local/lib/ 2>/dev/null || true
-          sudo cp -rf data/data/com.termux/files/usr/lib/* /usr/lib/ 2>/dev/null || true
-          
-          # Set environment variables
-          echo "IS_TERMUX=1" >> $GITHUB_ENV
-          echo "BOX64_BUILD_TYPE=Release" >> $GITHUB_ENV
+    - name: Setup Android NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26d
+        add-to-path: false
 
-      - name: Build Box64 for Termux
-        run: |
-          mkdir -p build
-          cd build
-          cmake .. \
-            -DCMAKE_C_COMPILER=${{ env.BOX64_COMPILER }} \
-            -DTERMUX=1 \
-            -DARM_DYNAREC=1 \
-            -DBAD_SIGNAL=1 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON
-          make -j$(nproc)
+    - name: Setup Termux Environment
+      run: |
+        # Install dependencies untuk Termux build
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          make \
+          clang \
+          git \
+          wget
 
-      - name: Verify Binary
-        run: |
-          if [ -f build/box64 ]; then
-            echo "✅ Binary successfully built!"
-            ls -lh build/box64
-            file build/box64
-          else
-            echo "❌ Binary not found!"
-            exit 1
-          fi
+    - name: Configure CMake for Termux
+      run: |
+        mkdir -p build
+        cd build
+        cmake .. \
+          -DTERMUX=1 \
+          -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DARM_DYNAREC=ON \
+          -DBAD_SIGNAL=ON \
+          -DNOGIT=1
 
-      - name: Get Git Commit Short ID
-        id: git-info
-        run: echo "SHORT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+    - name: Build Box64
+      run: |
+        cd build
+        make -j$(nproc)
 
-      - name: Upload Box64 Binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: box64-termux-${{ env.SHORT_COMMIT }}
-          path: build/box64
-          retention-days: 30
+    - name: Prepare artifacts for Termux
+      run: |
+        cd build
+        # Strip binary untuk mengurangi ukuran
+        llvm-strip box64
+        
+        # Buat package sederhana untuk Termux
+        mkdir -p box64-termux-package
+        cp box64 box64-termux-package/
+        
+        # Buat script instalasi
+        cat > box64-termux-package/install.sh << 'EOF'
+        #!/data/data/com.termux/files/usr/bin/bash
+        echo "Installing Box64 for Termux..."
+        cp box64 $PREFIX/bin/
+        chmod +x $PREFIX/bin/box64
+        echo "Box64 installed successfully!"
+        echo "Note: Box64 in native Termux is experimental and won't run Linux binaries!"
+        EOF
+        
+        chmod +x box64-termux-package/install.sh
+        
+        # Buat README
+        cat > box64-termux-package/README.md << 'EOF'
+        # Box64 for Termux Native
+        
+        Ini adalah build Box64 untuk Termux native (experimental).
+        
+        ## Instalasi
+        1. Extract archive ini di Termux
+        2. Jalankan `bash install.sh`
+        
+        ## Peringatan
+        Box64 di Termux native bersifat experimental dan TIDAK akan bisa menjalankan binary Linux biasa.
+        
+        ## Requirements
+        - libandroid-sysv-semaphore
+        - libandroid-spawn
+        
+        Install requirements:
+        ```bash
+        pkg install libandroid-sysv-semaphore libandroid-spawn
+        ```
+        EOF
 
-      - name: Upload Box64 Binary (as latest)
-        uses: actions/upload-artifact@v4
-        with:
-          name: box64-termux-latest
-          path: build/box64
-          retention-days: 30
+    - name: Create Termux package archive
+      run: |
+        cd build
+        tar -czf box64-termux-native.tar.gz box64-termux-package/
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: box64-termux-native
+        path: build/box64-termux-native.tar.gz
+        compression-level: 0
+
+    - name: Upload binary artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: box64-binary
+        path: build/box64
+        compression-level: 0
